@@ -4,17 +4,18 @@
  * 27-Dec-2000 T.Haran tharan@kryos.colorado.edu 303-492-1847
  * National Snow & Ice Data Center, University of Colorado, Boulder
  *========================================================================*/
-static const char fornav_c_rcsid[] = "$Header: /data/tharan/ms2gth/src/fornav/fornav.c,v 1.31 2007/05/07 17:58:44 tharan Exp $";
+static const char fornav_c_rcsid[] = "$Header: /disks/megadune/data/tharan/ms2gth/src/fornav/fornav.c,v 1.32 2012/07/24 21:42:17 tharan Exp $";
 
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#include "define.h"
-#include "matrix.h"
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #define USAGE \
-"$Revision: 1.31 $\n" \
+"$Revision: 1.32 $\n" \
 "usage: fornav chan_count\n"\
 "              [-v] [-m]\n"\
 "              [-s chan_scan_first colrow_scan_first]\n"\
@@ -135,6 +136,30 @@ static const char fornav_c_rcsid[] = "$Header: /data/tharan/ms2gth/src/fornav/fo
 
 #define EPSILON (1e-8)
 
+// Calculate the array offset for the specified row (r) and column (c) given that there are `tc` total columns
+#define RC_OFFSET(r,c,tc) r * tc + c
+
+// Copied from define.h for all-in-one fornav
+#ifndef FALSE
+#define FALSE 0
+#endif
+#ifndef TRUE
+#define TRUE 1
+#endif
+
+#define ABORT EXIT_FAILURE
+#define error_exit(msg) {fprintf(stderr,"%s\n",msg); exit(ABORT);}
+
+typedef int bool;
+
+typedef unsigned char byte1;
+typedef unsigned short int byte2;
+typedef unsigned int byte4;
+
+typedef short int int2;
+typedef int int4;
+// End define.h copy
+
 typedef struct {
   char  *name;
   char  *file;
@@ -147,7 +172,7 @@ typedef struct {
   int   cols;
   int   rows;
   int   bytes_per_row;
-  void  **buf;
+  void  *buf;
 } image;
 
 typedef struct {
@@ -188,6 +213,10 @@ static void DisplayInvalidParameter(char *param)
 {
   fprintf(stderr, "fornav: Parameter %s is invalid.\n", param);
   DisplayUsage();
+}
+
+static inline int IsFill(float val, float fill) {
+    return isnan(val) || val == fill;
 }
 
 static void InitializeImage(image *ip, char *name, char *open_type_str,
@@ -244,8 +273,9 @@ static void InitializeImage(image *ip, char *name, char *open_type_str,
   ip->cols = cols;
   ip->rows = rows;
   ip->bytes_per_row = ip->bytes_per_cell * cols;
-  ip->buf = matrix(ip->rows, ip->cols, ip->bytes_per_cell, 1);
+  ip->buf = calloc(ip->rows * ip->cols, ip->bytes_per_cell);
   if (ip->buf == NULL) {
+    perror("image initialization");
     fprintf(stderr, "Error initializing %s\n", name);
     error_exit("fornav: InitializeImage: can't allocate memory for buffer");
   }
@@ -255,7 +285,7 @@ static void InitializeImage(image *ip, char *name, char *open_type_str,
     offset = ip->bytes_per_row * (off_t)ip->rows * swath_scan_first;
     if (very_verbose)
       fprintf(stderr, "seeking to byte %lld in %s\n", offset, ip->file);
-    if (lseek(fileno(ip->fp), offset, SEEK_SET) != 0) {
+    if (fseeko(ip->fp, offset, SEEK_SET) != 0) {
       fprintf(stderr,
               "fornav: InitializeImage: error seeking to byte %lld in %s\n",
               offset, ip->file);
@@ -265,20 +295,97 @@ static void InitializeImage(image *ip, char *name, char *open_type_str,
   }
 }
 
+static void InitializeGridImage(image *ip, char *name,
+        char *data_type_str, int cols, int rows)
+{
+  if (very_verbose)
+    fprintf(stderr, "Initializing %s\n", name);
+  ip->name = strdup(name);
+  ip->open_type_str = strdup("mmap");
+
+  int fd = open(ip->file, O_CREAT | O_RDWR | O_TRUNC, 0644);
+  ip->fp = fdopen(fd, "r+");
+  if (fd < 0 || ip->fp == NULL) {
+      fprintf(stderr, "fornav: InitializeImage: error opening %s\n", ip->file);
+      perror("fornav");
+      exit(ABORT);
+  }
+  ip->data_type_str = strdup(data_type_str);
+  if (!strcmp(ip->data_type_str, "u1"))
+    ip->data_type = TYPE_BYTE;
+  else if (!strcmp(ip->data_type_str, "u2"))
+    ip->data_type = TYPE_UINT2;
+  else if (!strcmp(ip->data_type_str, "s2"))
+    ip->data_type = TYPE_SINT2;
+  else if (!strcmp(ip->data_type_str, "u4"))
+    ip->data_type = TYPE_UINT4;
+  else if (!strcmp(ip->data_type_str, "s4"))
+    ip->data_type = TYPE_SINT4;
+  else if (!strcmp(ip->data_type_str, "f4"))
+    ip->data_type = TYPE_FLOAT;
+  else
+    ip->data_type = TYPE_UNDEF;
+
+  switch (ip->data_type) {
+    case TYPE_BYTE:
+      ip->bytes_per_cell = 1;
+          break;
+    case TYPE_UINT2:
+    case TYPE_SINT2:
+      ip->bytes_per_cell = 2;
+          break;
+    case TYPE_UINT4:
+    case TYPE_SINT4:
+    case TYPE_FLOAT:
+      ip->bytes_per_cell = 4;
+          break;
+    case TYPE_UNDEF:
+    default:
+    error_exit("fornav: InitializeImage: Undefined data type");
+          break;
+  }
+
+  ip->cols = cols;
+  ip->rows = rows;
+  ip->bytes_per_row = ip->bytes_per_cell * cols;
+  if (lseek(fd, cols * rows * ip->bytes_per_cell - 1, SEEK_SET) == -1) {
+	close(fd);
+	perror("fornav");
+	exit(ABORT);
+  }
+  if (write(fd, "", 1) != 1) {
+	close(fd);
+	perror("fornav");
+	exit(ABORT);
+  }
+  ip->buf = mmap(NULL, cols * rows * ip->bytes_per_cell, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (ip->buf == MAP_FAILED) {
+    perror("grid mmap allocation");
+    exit(ABORT);
+  }
+}
+
 static void DeInitializeImage(image *ip)
 {
   if (very_verbose)
     fprintf(stderr, "DeInitializing %s\n", ip->name);
   if (ip->name)
     free(ip->name);
-  if (ip->open_type_str)
-    free(ip->open_type_str);
   if (ip->data_type_str)
     free(ip->data_type_str);
+  if (!strcmp(ip->open_type_str, "mmap")) {
+    if (munmap(ip->buf, ip->rows * ip->cols * ip->bytes_per_cell) != 0) {
+      fprintf(stderr, "failed to unmap grid image");
+      perror("fornav");
+      exit(ABORT);
+    }
+  } else if (ip->buf) {
+    free(ip->buf);
+  }
   if (ip->fp)
     fclose(ip->fp);
-  if (ip->buf)
-    free(ip->buf);
+  if (ip->open_type_str)
+    free(ip->open_type_str);
 }
 
 static void ReadImage(image *ip, float offset)
@@ -289,13 +396,13 @@ static void ReadImage(image *ip, float offset)
 
   if (very_verbose)
     fprintf(stderr, "Reading %s\n", ip->file);
-  if (fread(ip->buf[0], ip->bytes_per_row, ip->rows, ip->fp) != ip->rows) {
+  if (fread(ip->buf, ip->bytes_per_row, ip->rows, ip->fp) != ip->rows) {
     fprintf(stderr, "fornav: ReadImage: error reading %s\n", ip->file);
     perror("fornav");
     exit(ABORT);
   }
   if (offset) {
-    ptr = (float *)(ip->buf[0]);
+    ptr = (float *)(ip->buf);
     n = ip->cols * ip->rows;
     for (i = 0; i < n; i++)
       *ptr++ -= offset;
@@ -429,13 +536,13 @@ static void ComputeEwaParameters(image *uimg, image *vimg, ewa_weight *ewaw,
   qmax = ewaw->qmax;
   distance_max = ewaw->distance_max;
   delta_max = ewaw->delta_max;
-  u_frst_row_this_col = (float *)(uimg->buf[0]) + 1;
-  u_last_row_this_col = (float *)(uimg->buf[rowsm1]) + 1;
-  v_frst_row_this_col = (float *)(vimg->buf[0]) + 1;
-  v_last_row_this_col = (float *)(vimg->buf[rowsm1]) + 1;
-  u_midl_row_prev_col = (float *)(uimg->buf[rowsov2]);
+  u_frst_row_this_col = (float *)(uimg->buf) + 1;
+  u_last_row_this_col = (float *)(uimg->buf) + rowsm1 * uimg->cols + 1;
+  v_frst_row_this_col = (float *)(vimg->buf) + 1;
+  v_last_row_this_col = (float *)(vimg->buf) + rowsm1 * uimg->cols + 1;
+  u_midl_row_prev_col = (float *)(uimg->buf) + rowsov2 * uimg->cols;
   u_midl_row_next_col = u_midl_row_prev_col + 2;
-  v_midl_row_prev_col = (float *)(vimg->buf[rowsov2]);
+  v_midl_row_prev_col = (float *)(vimg->buf) + rowsov2 * uimg->cols;
   v_midl_row_next_col = v_midl_row_prev_col + 2;
   for (col = 1, this_ewap = ewap + 1;
        col < colsm1;
@@ -513,14 +620,14 @@ bool ComputeEwa(image *uimg, image *vimg,
                        int grid_col_start, int grid_row_start,
                        image *grid_chan_image, image *grid_weight_images)
 {
-  int   row;
-  int   rows;
-  int   col;
-  int   cols;
+  unsigned int   row;
+  unsigned int   rows;
+  unsigned int   col;
+  unsigned int   cols;
   float *u0p;
   float *v0p;
   float *wtab;
-  float *weightp;
+//  float *weightp;
   float *this_weightp;
   float *swath_chanp;
   float *swath_fillp;
@@ -592,18 +699,17 @@ bool ComputeEwa(image *uimg, image *vimg,
   this_grid_fillp  = grid_fillp;
   for (chan = 0; chan < chan_count; chan++) {
     *this_swath_fillp++ = (this_swath++)->fill;
-    *this_grid_chanpp++ = (float *)((this_grid)->buf[0]);
+    *this_grid_chanpp++ = (float *)((this_grid)->buf);
     *this_grid_fillp++ = (this_grid++)->fill;
   }
   got_point = FALSE;
-  for (row = 0; row < rows; row++) {
-    u0p = (float *)(uimg->buf[row]);
-    v0p = (float *)(vimg->buf[row]);
+  u0p = (float *)uimg->buf;
+  v0p = (float *)vimg->buf;
+  for (row=0, swath_offset=0, u0=*u0p++, v0=*v0p++; row < rows; row++) {
     for (col = 0, this_ewap = ewap;
          col < cols;
-         col++, this_ewap++) {
-      u0 = *u0p++;
-      v0 = *v0p++;
+          col++, this_ewap++, swath_offset++, u0=*u0p++, v0=*v0p++) {
+      // XXX: If this is always the default (0) then if its hardcoded it may be optimized much more by the compiler
       if (u0 >= col_row_min && v0 >= col_row_min) {
         u0 -= grid_col_start;
         v0 -= grid_row_start;
@@ -622,14 +728,16 @@ bool ComputeEwa(image *uimg, image *vimg,
         if (iu1 < grid_cols && iu2 >= 0 &&
             iv1 < grid_rows && iv2 >= 0) {
           got_point = TRUE;
-          swath_offset = col + row * cols;
           this_swath = swath_chan_image;
           this_swath_chanp = swath_chanp;
           this_swath_fillp = swath_fillp;
           for (chan = 0; chan < chan_count; chan++, this_swath++) {
             got_fills[chan] = FALSE;
-            this_buf = this_swath->buf[0];
+            this_buf = this_swath->buf;
             switch (this_swath->data_type) {
+            case TYPE_FLOAT:
+              *this_swath_chanp = *((float *)this_buf + swath_offset);
+              break;
             case TYPE_BYTE:
               *this_swath_chanp = *((byte1 *)this_buf + swath_offset);
               break;
@@ -645,11 +753,9 @@ bool ComputeEwa(image *uimg, image *vimg,
             case TYPE_SINT4:
               *this_swath_chanp = *((int4 *)this_buf + swath_offset);
               break;
-            case TYPE_FLOAT:
-              *this_swath_chanp = *((float *)this_buf + swath_offset);
-              break;
             }
-            if (*this_swath_chanp++ == *this_swath_fillp++) {
+            // Handle NaN properly
+            if (IsFill(*this_swath_chanp++, *this_swath_fillp++)) {
               got_fills[chan] = TRUE;
             }
           } /* for (chan = 0; chan < chan_count; chan++, this_swath++) */
@@ -672,14 +778,14 @@ bool ComputeEwa(image *uimg, image *vimg,
                 if (iw >= weight_count)
                   iw = weight_count - 1;
                 weight = wtab[iw];
-                grid_offset = iu + iv * grid_cols;
+                grid_offset = RC_OFFSET(iv, iu, grid_cols);
                 this_grid_weight_image = grid_weight_images;
                 this_swath_chanp = swath_chanp;
                 this_grid_fillp  = grid_fillp;
                 this_grid_chanpp = grid_chanpp;
                 if (maximum_weight_mode) {
                   for (chan = 0; chan < chan_count; chan++) {
-                    this_weightp = ((float *)this_grid_weight_image->buf[0]) + grid_offset;
+                    this_weightp = ((float *)this_grid_weight_image->buf + grid_offset);
                     if (weight > *this_weightp) {
                       *this_weightp = weight;
                       if (got_fills[chan]) {
@@ -688,6 +794,7 @@ bool ComputeEwa(image *uimg, image *vimg,
                         *(*this_grid_chanpp + grid_offset) = *this_swath_chanp;
                       }
                     }
+                    // increment pointers even if we didn't change anything
                     this_grid_chanpp++;
                     this_grid_fillp++;
                     this_swath_chanp++;
@@ -696,17 +803,11 @@ bool ComputeEwa(image *uimg, image *vimg,
                 } else {
                   for (chan = 0; chan < chan_count; chan++) {
                     if (got_fills[chan] == FALSE) {
-                      this_weightp = ((float *)this_grid_weight_image->buf[0]) + grid_offset;
+                      this_weightp = ((float *)this_grid_weight_image->buf + grid_offset);
                       *this_weightp += weight;
-
-                      if (*(*this_grid_chanpp + grid_offset) == *this_grid_fillp) {
-                        // If the fill value is nonzero we don't want to
-                        // effect the weight/grid values
-                        *(*this_grid_chanpp + grid_offset) = *this_swath_chanp * weight;
-                      } else {
-                        *(*this_grid_chanpp + grid_offset) += *this_swath_chanp * weight;
-                      }
+                      *(*this_grid_chanpp + grid_offset) += *this_swath_chanp * weight;
                     }
+                    // increment pointers even if there was a fill value
                     this_grid_chanpp++;
                     this_grid_fillp++;
                     this_swath_chanp++;
@@ -730,9 +831,9 @@ int WriteGridImage(image *ip, image *wp,
                    bool maximum_weight_mode, float weight_sum_min,
                    image *iop)
 {
-  float **chanpp;
+  float *chanpp;
   float *this_chanp;
-  float **weightpp;
+  float *weightpp;
   float *this_weightp;
   float fill;
   float chanf;
@@ -740,7 +841,6 @@ int WriteGridImage(image *ip, image *wp,
   void  *chanp_out;
   byte1 *this_chanp_out;
   int   rows;
-  int   row;
   int   cols;
   int   col;
   int   bytes_per_cell;
@@ -748,17 +848,17 @@ int WriteGridImage(image *ip, image *wp,
   int   rows_out;
   int   data_type;
   int   fill_count;
-  FILE  *fp;
 
   if (very_verbose)
     fprintf(stderr, "Writing %s\n", iop->file);
-  chanpp = (float **)(ip->buf);
-  weightpp = (float **)(wp->buf);
-  chanp_out = iop->buf[0];
+  chanpp = (float *)(ip->buf);
+  this_chanp = chanpp;
+  weightpp = (float *)(wp->buf);
+  this_weightp = weightpp;
+  chanp_out = iop->buf;
   bytes_per_cell = iop->bytes_per_cell;
   bytes_per_row = iop->bytes_per_row;
   rows_out = iop->rows;
-  fp = iop->fp;
   rows = ip->rows;
   cols = ip->cols;
   fill = iop->fill;
@@ -767,12 +867,10 @@ int WriteGridImage(image *ip, image *wp,
     weight_sum_min = EPSILON;
   roundoff = (data_type == TYPE_FLOAT) ? 0.0 : 0.5;
   fill_count = 0;
-  for (row = 0; row < rows; row++) {
-    this_chanp = *chanpp++;
-    this_weightp = *weightpp++;
-    this_chanp_out = (byte1 *)chanp_out;
+  this_chanp_out = (byte1 *)chanp_out;
+//  for (row = 0; row < rows; row++) {
     for (col = 0;
-         col < cols;
+         col < cols * rows;
          col++,
            this_chanp++,
            this_weightp++,
@@ -832,20 +930,20 @@ int WriteGridImage(image *ip, image *wp,
         *((int4 *)this_chanp_out) = (int4)chanf;
         break;
       case TYPE_FLOAT:
-        if (chanf == fill)
+        if (IsFill(chanf, fill))
           fill_count++;
         *((float *)this_chanp_out) = chanf;
         break;
       }
     } /* for (col = 0; col < cols; col++) */
 
-    if (fwrite(chanp_out, bytes_per_row, rows_out, fp) != rows_out) {
-      fprintf(stderr, "fornav: WriteGridImage: error writing %s\n",
-              iop->file);
-      perror("fornav");
-      exit(ABORT);
-    }
-  } /* for (row = 0; row < rows; row++) */
+//    if (fwrite(chanp_out, bytes_per_row, rows_out, fp) != rows_out) {
+//      fprintf(stderr, "fornav: WriteGridImage: error writing %s\n",
+//              iop->file);
+//      perror("fornav");
+//      exit(ABORT);
+//    }
+//  } /* for (row = 0; row < rows; row++) */
   return(fill_count);
 }
 
@@ -891,12 +989,12 @@ int main (int argc, char *argv[])
   ewa_weight     ewaw;
 
   int   i;
-  int   j;
-  int   n;
+//  int   j;
+//  int   n;
   int   chan_scan_last;
   int   scan;
-  float *fptr;
-  float fill;
+//  float *fptr;
+//  float fill;
   
   /*
    *        set defaults
@@ -1038,7 +1136,6 @@ int main (int argc, char *argv[])
             DisplayInvalidParameter("grid_fill");
           if (sscanf(*argv, "%f", &grid_chan_io_image[i].fill) != 1)
             DisplayInvalidParameter("grid_fill");
-          grid_chan_image[i].fill = grid_chan_io_image[i].fill;
         }
         break;
       case 'r':
@@ -1195,27 +1292,31 @@ int main (int argc, char *argv[])
 
   InitializeImage(swath_row_image, "swath_row_image", "r", "f4",
                   swath_cols, swath_rows_per_scan, colrow_scan_first);
+  char name[100];
   for (i = 0; i < chan_count; i++) {
-    char name[100];
-    sprintf(name, "swath_chan_image %d", i); 
+    sprintf(name, "swath_chan_image %d", i);
     InitializeImage(&swath_chan_image[i], name, "r",
                     swath_chan_image[i].data_type_str,
                     swath_cols, swath_rows_per_scan, chan_scan_first);
-    sprintf(name, "grid_chan_io_image %d", i); 
-    InitializeImage(&grid_chan_io_image[i], name, "w",
-                    grid_chan_io_image[i].data_type_str,
-                    grid_cols, 1, 0);
-    sprintf(name, "grid_chan_image %d", i); 
+    sprintf(name, "grid_chan_image %d", i);
     InitializeImage(&grid_chan_image[i], name, "", "f4",
                     grid_cols, grid_rows, 0);
     sprintf(name, "grid_weight_images %d", i); 
     InitializeImage(&grid_weight_images[i], name, "", "f4",
                     grid_cols, grid_rows, 0);
-    n = grid_cols * grid_rows;
-    fptr =&(**((float **)grid_chan_image[i].buf));
-    fill = grid_chan_io_image[i].fill;
-    for (j = 0; j < n; j++)
-      *fptr++ = fill;
+//    n = grid_cols * grid_rows;
+//    fptr =(float *)grid_chan_image[i].buf;
+//    fill = grid_chan_io_image[i].fill;
+//    for (j = 0; j < n; j++)
+      /*
+       * Filling with a non-zero fill value here produces garbage output
+       * when averaging, but filling with zero is ok and still produces
+       * the desired grid fill value wherever the swath fill value is
+       * encountered.
+       *
+       *  fptr++ = fill;
+       */
+//      *fptr++ = 0.0;
   }
 
   /*
@@ -1273,12 +1374,24 @@ int main (int argc, char *argv[])
   } /* for (scan = chan_scan_first; scan <= chan_scan_last; scan++) */
 
   /*
+   * De-Initialize Input Images
+   */
+  DeInitializeImage(swath_col_image);
+  DeInitializeImage(swath_row_image);
+  for (i = 0; i < chan_count; i++) {
+    DeInitializeImage(&swath_chan_image[i]);
+  }
+
+  /*
    *  Write out gridded channel data for each channel
    */
   for (i = 0; i < chan_count; i++) {
+    sprintf(name, "grid_chan_io_image %d", i);
+    InitializeGridImage(&grid_chan_io_image[i], name, grid_chan_io_image[i].data_type_str, grid_cols, grid_rows);
     fill_count = WriteGridImage(&grid_chan_image[i], &grid_weight_images[i],
                                 maximum_weight_mode, weight_sum_min,
                                 &grid_chan_io_image[i]);
+
     if (verbose)
       fprintf(stderr, "fill count[%d]: %d\n", i, fill_count);
   }
@@ -1286,10 +1399,7 @@ int main (int argc, char *argv[])
   /*
    *  De-Initialize images
    */
-  DeInitializeImage(swath_col_image);
-  DeInitializeImage(swath_row_image);
   for (i = 0; i < chan_count; i++) {
-    DeInitializeImage(&swath_chan_image[i]);
     DeInitializeImage(&grid_chan_io_image[i]);
     DeInitializeImage(&grid_chan_image[i]);
     DeInitializeImage(&grid_weight_images[i]);

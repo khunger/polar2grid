@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- To be placed in .../edex/data/utility/common_static/site/<site>/satellite/goesr/descriptions/Polar/ -->
+<!-- Should also have the below regular expression added to .../edex/data/utility/common_static/site/<site>/distribution/goesr.xml -->
+<!-- <regex>SSEC_AII_.*_T\w{3}_\d{8}_\d{4,6}.nc$</regex> -->
+<goesrProductDescriptions>
+    <default>
+        <matches>
+            <match pattern="AWIPS_.+">
+                <attribute name="awips_id" />
+            </match>
+        </matches>
+    </default>
+    <description>
+        <source>
+            <attribute name="production_location" />
+        </source>
+        <physicalElement>
+            <attribute name="physical_element" />
+        </physicalElement>
+        <creatingEntity>
+            <attribute name="satellite_id" />
+        </creatingEntity>
+        <dataTime>
+            <formattedRefTime dateFormat="yyyy-MM-dd'T'HH:mm:ss">
+                <attribute name="start_date_time" />
+            </formattedRefTime>
+        </dataTime>
+        <sectorID>
+            <attribute name="sector_id" />
+        </sectorID>
+        <data>
+            <variable name="data" />
+        </data>
+    </description>
+</goesrProductDescriptions>

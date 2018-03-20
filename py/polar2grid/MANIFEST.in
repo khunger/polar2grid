@@ -1,3 +1,0 @@
-include polar2grid/awips/*.conf
-recursive-include polar2grid/grids *.gpd *.ncml
-
